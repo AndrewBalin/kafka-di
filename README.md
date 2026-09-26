@@ -1,9 +1,9 @@
 # Kafka DI
 
 <!-- badges:start -->
-[![kafka-di](https://img.shields.io/badge/kafka-di-0.1.0-3776AB?logo=pypi&logoColor=white)](https://pypi.org/project/kafka-di/)
+[![kafka-di](https://img.shields.io/badge/kafka--di-0.1.0-3776AB?logo=pypi&logoColor=white)](https://pypi.org/project/kafka-di/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
-[![confluent-kafka](https://img.shields.io/badge/confluent-kafka-%3E%3D2.0-231F20?logo=apachekafka&logoColor=white)](https://pypi.org/project/confluent-kafka/)
+[![confluent-kafka](https://img.shields.io/badge/confluent--kafka-%3E%3D2.0-231F20?logo=apachekafka&logoColor=white)](https://pypi.org/project/confluent-kafka/)
 <!-- badges:end -->
 
 Kafka DI is a lightweight framework for event-driven Python applications built on Apache Kafka. It provides declarative consumer handlers, dependency injection, and middleware with a small API inspired by FastAPI.

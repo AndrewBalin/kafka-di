@@ -12,7 +12,11 @@ BADGES_PATTERN = re.compile(r'<!-- badges:start -->.*?<!-- badges:end -->', re.D
 
 
 def badge(label: str, value: str, color: str, logo: str) -> str:
-    badge_url = f'https://img.shields.io/badge/{quote(label)}-{quote(value)}-{color}?logo={quote(logo)}&logoColor=white'
+    escaped_label = quote(label).replace('-', '--')
+    escaped_value = quote(value).replace('-', '--')
+    badge_url = (
+        f'https://img.shields.io/badge/{escaped_label}-{escaped_value}-{color}?logo={quote(logo)}&logoColor=white'
+    )
     return badge_url
 
 
