@@ -10,7 +10,7 @@ permissions:
 
 jobs:
   build:
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
@@ -22,7 +22,7 @@ jobs:
 
   publish-to-pypi:
     needs: build
-    runs-on: ubuntu-latest
+    runs-on: self-hosted
     environment:
       name: pypi
       url: https://pypi.org/p/kafka-di
