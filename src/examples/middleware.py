@@ -1,25 +1,29 @@
-from kafka_di import Kafka
+from pydantic import BaseModel
+
+from kafka_di import JsonCodec, Kafka
 from kafka_di.config import Config
+from kafka_di.message.models import DecodedMessage
 from kafka_di.middlewares import ConsumerMiddleware
 
-config = Config(bootstrap_servers='localhost:9092', group_id='test-group')
 
-app = Kafka(configs=config)
-
-
-# Define middleware
-class Middleware(ConsumerMiddleware):
-    def handle(self, msg):
-        print('Middleware executed')
+class UserRegistered(BaseModel):
+    user_id: str
 
 
-# Register middleware
-app.register_middleware(Middleware())
+class LoggingMiddleware(ConsumerMiddleware):
+    def handle(self, message: DecodedMessage):
+        print(f'Received {message.topic} at offset {message.offset}')
 
 
-@app.consumer.subscribe('test-topic')
-def handle(msg):
-    print(msg)
+config = Config(bootstrap_servers='localhost:9092', group_id='notifications-service')
+app = Kafka(configs=config, codec=JsonCodec())
+app.register_middleware(LoggingMiddleware())
 
 
-app.run()
+@app.consumer.subscribe('users.registered', value_type=UserRegistered)
+async def send_welcome_notification(event: UserRegistered):
+    print(f'Sending a welcome notification to {event.user_id}')
+
+
+if __name__ == '__main__':
+    app.run()

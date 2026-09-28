@@ -1,7 +1,7 @@
 # Kafka DI
 
 <!-- badges:start -->
-[![kafka-di](https://img.shields.io/badge/kafka--di-0.1.3-3776AB?logo=pypi&logoColor=white)](https://pypi.org/project/kafka-di/)
+[![kafka-di](https://img.shields.io/badge/kafka--di-0.2.0-3776AB?logo=pypi&logoColor=white)](https://pypi.org/project/kafka-di/)
 [![Python](https://img.shields.io/badge/python-%3E%3D3.13-3776AB?logo=python&logoColor=white)](https://www.python.org/)
 [![confluent-kafka](https://img.shields.io/badge/confluent--kafka-%3E%3D2.0-231F20?logo=apachekafka&logoColor=white)](https://pypi.org/project/confluent-kafka/)
 <!-- badges:end -->
@@ -139,6 +139,23 @@ async def handle_order(message):
     await persist_order(message.value)
 ```
 
+Decode a topic directly into a typed event with a codec:
+
+```python
+from pydantic import BaseModel
+
+from kafka_di import JsonCodec
+
+
+class OrderCreated(BaseModel):
+    id: int
+
+
+@app.consumer.subscribe('orders.created', value_type=OrderCreated, codec=JsonCodec())
+async def handle_order(event: OrderCreated):
+    await persist_order(event)
+```
+
 ## Dependency injection
 
 Use `Depends` to resolve dependencies for a handler:
@@ -154,6 +171,32 @@ def get_database():
 @app.consumer.subscribe('events')
 def handle_event(message, database=Depends(get_database)):
     database.save(message.value)
+```
+
+Providers may be synchronous, asynchronous, nested, or generator-based. Results are cached for one message by
+default; use `Depends(provider, use_cache=False)` to resolve a fresh value. Generator cleanup runs before the Kafka
+offset is committed.
+
+```python
+async def get_transaction():
+    async with database.transaction() as transaction:
+        yield transaction
+
+
+async def get_order_service(transaction=Depends(get_transaction)):
+    return OrderService(transaction)
+
+
+@app.consumer.subscribe('orders.created', value_type=OrderCreated, codec=JsonCodec())
+async def handle_order(event: OrderCreated, service=Depends(get_order_service)):
+    await service.create(event)
+```
+
+For typed publishing, configure a default codec on the application or pass one to `publish()`:
+
+```python
+app = Kafka(configs=config, codec=JsonCodec())
+app.producer.publish('orders.created', OrderCreated(id=42), key='42')
 ```
 
 ## Middleware
@@ -195,6 +238,9 @@ docker compose up -d
 ```
 
 Kafka is available at `localhost:9092` and Kafka UI at <http://localhost:8080>.
+
+Runnable consumer, producer, middleware, and dependency-injection examples are documented in
+[`src/examples/README.md`](src/examples/README.md).
 
 ## Releasing
 

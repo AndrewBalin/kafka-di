@@ -1,11 +1,22 @@
-from kafka_di import Producer
+from pydantic import BaseModel
+
+from kafka_di import JsonCodec, Producer
 from kafka_di.config import Config
 
-# Initialize the producer
-config = Config(bootstrap_servers='localhost:9092', group_id='test-group')
 
-producer = Producer(configs=config)
+class OrderCreated(BaseModel):
+    order_id: str
+    customer_id: str
 
-# Produce a message to a topic
-producer.produce('test-topic', value=b'Hello, Kafka!')
-producer.flush()
+
+config = Config(bootstrap_servers='localhost:9092', group_id='examples-producer')
+
+
+if __name__ == '__main__':
+    producer = Producer(configs=config, codec=JsonCodec())
+    producer.publish(
+        'orders.created',
+        OrderCreated(order_id='order-42', customer_id='customer-7'),
+        key='order-42',
+    )
+    producer.flush()
