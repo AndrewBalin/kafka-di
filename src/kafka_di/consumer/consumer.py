@@ -6,45 +6,57 @@ from typing import Any, Callable, Sequence
 from confluent_kafka import Consumer as ConfluentConsumer
 from confluent_kafka.aio import AIOConsumer
 
+from kafka_di.codecs import Codec
+from kafka_di.consumer.context import ConsumerContext
 from kafka_di.consumer.handler import Handler
 from kafka_di.consumer.pipeline import ConsumerPipeline
+from kafka_di.consumer.subscription import RegisteredSubscription, Subscription
 from kafka_di.message.models import DecodedMessage, Message
 from kafka_di.middlewares.base import Middleware
 from kafka_di.serializers.base import Serializer
 
 
-class ConsumerContext:
-    def __init__(self):
-        self._should_commit = True
-
-    def uncommit(self):
-        self._should_commit = False
-
-    @property
-    def should_commit(self) -> bool:
-        return self._should_commit
-
-
 class Consumer:
     def __init__(
         self,
-        configs: dict[str, Any] = {},
+        configs: dict[str, Any] | None = None,
         serializer: Serializer | None = None,
-        middlewares: Sequence[Middleware] = [],
+        middlewares: Sequence[Middleware] | None = None,
         app: Any | None = None,
+        codec: Codec | None = None,
     ):
-        self._configs = configs
+        self._configs = configs or {}
         self._serializer = serializer
-        self._middlewares = list(middlewares)
-        self._handlers: dict[str, Handler] = {}
+        self._codec = codec
+        self._middlewares = list(middlewares or ())
+        self._subscriptions: dict[str, RegisteredSubscription] = {}
         self._is_running = False
         self._consumer: ConfluentConsumer | AIOConsumer | None = None
         self._app = app
 
-    def subscribe(self, *topics: str) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
+    def subscribe(
+        self,
+        *topics: str,
+        value_type: type[Any] | None = None,
+        key_type: type[Any] | None = None,
+        codec: Codec | None = None,
+    ) -> Callable[[Callable[..., Any]], Callable[..., Any]]:
         def decorator(func: Callable[..., Any]) -> Callable[..., Any]:
+            duplicate_topics = {topic for topic in topics if topics.count(topic) > 1 or topic in self._subscriptions}
+            if duplicate_topics:
+                duplicates = ', '.join(repr(topic) for topic in sorted(duplicate_topics))
+                raise ValueError(f'A handler is already registered for topic(s): {duplicates}')
             for topic in topics:
-                self._handlers[topic] = Handler(func, app=self._app)
+                subscription = Subscription(
+                    topic=topic,
+                    value_type=value_type,
+                    key_type=key_type,
+                    codec=codec,
+                )
+                self._subscriptions[topic] = RegisteredSubscription(
+                    subscription=subscription,
+                    handler=Handler(func, app=self._app, value_type=value_type),
+                )
             return func
 
         return decorator
@@ -55,14 +67,22 @@ class Consumer:
     def set_serializer(self, serializer: Serializer):
         self._serializer = serializer
 
+    def set_codec(self, codec: Codec):
+        self._codec = codec
+
+    def set_app(self, app: Any):
+        self._app = app
+        for registered in self._subscriptions.values():
+            registered.handler.set_app(app)
+
     def add_middleware(self, middleware: Middleware):
         self._middlewares.append(middleware)
 
     def run(self):
-        if not self._handlers:
+        if not self._subscriptions:
             return
 
-        if any(handler.is_async for handler in self._handlers.values()):
+        if any(registered.handler.is_async for registered in self._subscriptions.values()):
             self._run_async()
             return
 
@@ -70,7 +90,7 @@ class Consumer:
         consumer_config.setdefault('enable.auto.commit', False)
 
         self._consumer = ConfluentConsumer(consumer_config)
-        self._consumer.subscribe(list(self._handlers.keys()))
+        self._consumer.subscribe(list(self._subscriptions.keys()))
         self._is_running = True
 
         try:
@@ -82,7 +102,7 @@ class Consumer:
                     # TODO: Add logging
                     continue
 
-                self._process_message(msg)
+                self._run_awaitable(self._process_message(msg))
         finally:
             self._is_running = False
             if self._consumer:
@@ -96,7 +116,7 @@ class Consumer:
         consumer_config.setdefault('enable.auto.commit', False)
 
         self._consumer = AIOConsumer(consumer_config)
-        await self._consumer.subscribe(list(self._handlers.keys()))
+        await self._consumer.subscribe(list(self._subscriptions.keys()))
         self._is_running = True
 
         try:
@@ -105,9 +125,7 @@ class Consumer:
                 if msg is None or msg.error():
                     continue
 
-                result = self._process_message(msg)
-                if inspect.isawaitable(result):
-                    await result
+                await self._process_message(msg)
         finally:
             self._is_running = False
             if self._consumer:
@@ -116,10 +134,10 @@ class Consumer:
     def stop(self):
         self._is_running = False
 
-    def _process_message(self, kafka_msg):
+    async def _process_message(self, kafka_msg):
         topic = kafka_msg.topic()
-        handler = self._handlers.get(topic)
-        if not handler:
+        registered = self._subscriptions.get(topic)
+        if not registered:
             return
 
         message = Message(
@@ -132,14 +150,30 @@ class Consumer:
             timestamp=kafka_msg.timestamp()[1] if kafka_msg.timestamp() else None,
         )
 
-        if self._serializer:
+        codec = registered.subscription.codec or self._codec
+        if codec:
+            key = message.key
+            if registered.subscription.key_type is not None:
+                key = codec.decode(message.key, target_type=registered.subscription.key_type)
+            decoded_message = DecodedMessage(
+                topic=message.topic,
+                key=key,
+                value=codec.decode(message.value, target_type=registered.subscription.value_type),
+                headers=self._decode_headers(message.headers),
+                partition=message.partition,
+                offset=message.offset,
+                timestamp=message.timestamp,
+                raw_key=message.key,
+                raw_value=message.value,
+            )
+        elif self._serializer:
             decoded_message = self._serializer.deserialize(message)
         else:
             decoded_message = DecodedMessage(
                 topic=message.topic,
                 key=message.key,
                 value=message.value,
-                headers={k: (v.decode() if v is not None else '') for k, v in message.headers.items()},
+                headers=self._decode_headers(message.headers),
                 partition=message.partition,
                 offset=message.offset,
                 timestamp=message.timestamp,
@@ -148,24 +182,21 @@ class Consumer:
             )
 
         pipeline = ConsumerPipeline(self._middlewares)
-        wrapped_handler = pipeline.wrap(handler)
+        wrapped_handler = pipeline.wrap(registered.handler)
         context = ConsumerContext()
         result = wrapped_handler(decoded_message, context=context)
         if inspect.isawaitable(result):
-            return self._handle_awaitable_result(result, context, kafka_msg)
+            await result
 
-        if context.should_commit and self._consumer:
-            self._consumer.commit(message=kafka_msg)
-
-        return None
-
-    async def _handle_awaitable_result(self, awaitable, context: ConsumerContext, kafka_msg):
-        await awaitable
         if context.should_commit and self._consumer:
             if isinstance(self._consumer, AIOConsumer):
                 await self._consumer.commit(message=kafka_msg)
             else:
                 self._consumer.commit(message=kafka_msg)
+
+    @staticmethod
+    def _decode_headers(headers: dict[str, bytes]) -> dict[str, str]:
+        return {key: value.decode() if value is not None else '' for key, value in headers.items()}
 
     @staticmethod
     def _run_awaitable(awaitable):

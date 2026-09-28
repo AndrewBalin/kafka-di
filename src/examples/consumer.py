@@ -1,21 +1,27 @@
 from kafka_di import Kafka
 from kafka_di.config import Config
-from kafka_di.consumer import Consumer
+from kafka_di.consumer import Consumer, ConsumerContext
+from kafka_di.message.models import DecodedMessage
 
-config = Config(bootstrap_servers='localhost:9092', group_id='test-group')
+config = Config(bootstrap_servers='localhost:9092', group_id='audit-service')
 
 app = Kafka(configs=config)
-
-# Create a separate consumer
 consumer = Consumer()
 
 
-@consumer.subscribe('test-topic')
-def handle(msg):
-    print(msg)
+@consumer.subscribe('audit.raw')
+def handle_raw_message(message: DecodedMessage, context: ConsumerContext):
+    print(
+        f'topic={message.topic} partition={message.partition} '
+        f'offset={message.offset} key={message.key!r} value={message.value!r}'
+    )
+
+    if message.value is None:
+        context.uncommit()
 
 
-# Register the consumer with the application
 app.register_consumer(consumer)
 
-app.run()
+
+if __name__ == '__main__':
+    app.run()

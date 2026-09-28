@@ -1,7 +1,8 @@
-__version__ = '0.1.0'
+__version__ = '0.2.0'
 
 from . import config
 from .app import Kafka
-from .consumer import Consumer
-from .di import Depends
+from .codecs import Codec, JsonCodec
+from .consumer import Consumer, ConsumerContext, MessageContext, Subscription
+from .di import DependencyContext, DependencyResolver, Depends
 from .producer import Producer

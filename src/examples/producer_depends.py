@@ -1,21 +1,29 @@
-from kafka_di import Depends, Kafka, Producer
+from pydantic import BaseModel
+
+from kafka_di import Depends, JsonCodec, Kafka, Producer
 from kafka_di.config import Config
 
-config = Config(bootstrap_servers='localhost:9092', group_id='test-group')
 
-app = Kafka(configs=config)
-
-
-# Dependency that provides a producer
-def get_producer() -> Producer:
-    return app.producer
+class OrderCreated(BaseModel):
+    order_id: str
 
 
-# Subscribe to a topic with a dependency
-@app.consumer.subscribe('test-topic')
-def handle(msg, producer: Producer = Depends(get_producer)):
-    print(msg)
-    producer.produce('response-topic', value=b'ACK')
+class InvoiceRequested(BaseModel):
+    order_id: str
 
 
-app.run()
+config = Config(bootstrap_servers='localhost:9092', group_id='billing-service')
+app = Kafka(configs=config, codec=JsonCodec())
+
+
+@app.consumer.subscribe('orders.created', value_type=OrderCreated)
+def request_invoice(event: OrderCreated, producer: Producer = Depends()):
+    producer.publish(
+        'invoices.requested',
+        InvoiceRequested(order_id=event.order_id),
+        key=event.order_id,
+    )
+
+
+if __name__ == '__main__':
+    app.run()
