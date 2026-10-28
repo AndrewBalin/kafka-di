@@ -10,10 +10,15 @@ from kafka_di.codecs import Codec
 from kafka_di.consumer.context import ConsumerContext
 from kafka_di.consumer.handler import Handler
 from kafka_di.consumer.pipeline import ConsumerPipeline
+from kafka_di.consumer.reliability import DeadLetterPublisher, RetryPolicy
 from kafka_di.consumer.subscription import RegisteredSubscription, Subscription
 from kafka_di.message.models import DecodedMessage, Message
 from kafka_di.middlewares.base import Middleware
 from kafka_di.serializers.base import Serializer
+
+
+class MessageRetryRequiredError(RuntimeError):
+    """Processing must stop before a later offset can commit past this record."""
 
 
 class Consumer:
@@ -24,8 +29,13 @@ class Consumer:
         middlewares: Sequence[Middleware] | None = None,
         app: Any | None = None,
         codec: Codec | None = None,
+        retry_policy: RetryPolicy | None = None,
+        dead_letter_publisher=None,
     ):
         self._configs = configs or {}
+        self._retry_policy = retry_policy
+        self._dead_letter_publisher = dead_letter_publisher
+        self.metrics = {'delivery_failures': 0, 'retries': 0, 'dlq_count': 0}
         self._serializer = serializer
         self._codec = codec
         self._middlewares = list(middlewares or ())
@@ -87,7 +97,8 @@ class Consumer:
             return
 
         consumer_config = self._configs.copy()
-        consumer_config.setdefault('enable.auto.commit', False)
+        consumer_config['enable.auto.commit'] = False
+        consumer_config['enable.auto.offset.store'] = False
 
         self._consumer = ConfluentConsumer(consumer_config)
         self._consumer.subscribe(list(self._subscriptions.keys()))
@@ -102,7 +113,7 @@ class Consumer:
                     # TODO: Add logging
                     continue
 
-                self._run_awaitable(self._process_message(msg))
+                self._run_awaitable(self._process_with_retries(msg))
         finally:
             self._is_running = False
             if self._consumer:
@@ -113,7 +124,8 @@ class Consumer:
 
     async def _run_async_loop(self):
         consumer_config = self._configs.copy()
-        consumer_config.setdefault('enable.auto.commit', False)
+        consumer_config['enable.auto.commit'] = False
+        consumer_config['enable.auto.offset.store'] = False
 
         self._consumer = AIOConsumer(consumer_config)
         await self._consumer.subscribe(list(self._subscriptions.keys()))
@@ -125,7 +137,7 @@ class Consumer:
                 if msg is None or msg.error():
                     continue
 
-                await self._process_message(msg)
+                await self._process_with_retries(msg)
         finally:
             self._is_running = False
             if self._consumer:
@@ -133,6 +145,32 @@ class Consumer:
 
     def stop(self):
         self._is_running = False
+
+    async def _commit(self, message):
+        if self._consumer:
+            if isinstance(self._consumer, AIOConsumer):
+                await self._consumer.commit(message=message, asynchronous=False)
+            else:
+                self._consumer.commit(message=message, asynchronous=False)
+
+    async def _process_with_retries(self, message):
+        policy = self._retry_policy
+        if policy is None:
+            return await self._process_message(message)
+        for attempt in range(1, policy.max_attempts + 1):
+            try:
+                return await self._process_message(message)
+            except Exception as error:
+                self.metrics['delivery_failures'] += 1
+                if attempt == policy.max_attempts:
+                    if self._dead_letter_publisher is None:
+                        self._dead_letter_publisher = DeadLetterPublisher(self._configs)
+                    await asyncio.to_thread(self._dead_letter_publisher.publish, message, error, attempt)
+                    self.metrics['dlq_count'] += 1
+                    await self._commit(message)
+                    return
+                self.metrics['retries'] += 1
+                await asyncio.sleep(min(policy.max_delay, policy.initial_delay * 2 ** (attempt - 1)))
 
     async def _process_message(self, kafka_msg):
         topic = kafka_msg.topic()
@@ -188,11 +226,9 @@ class Consumer:
         if inspect.isawaitable(result):
             await result
 
-        if context.should_commit and self._consumer:
-            if isinstance(self._consumer, AIOConsumer):
-                await self._consumer.commit(message=kafka_msg)
-            else:
-                self._consumer.commit(message=kafka_msg)
+        if not context.should_commit:
+            raise MessageRetryRequiredError('message processing requested retry')
+        await self._commit(kafka_msg)
 
     @staticmethod
     def _decode_headers(headers: dict[str, bytes]) -> dict[str, str]:

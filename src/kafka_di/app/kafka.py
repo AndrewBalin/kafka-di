@@ -1,5 +1,6 @@
 import signal
 import threading
+from queue import SimpleQueue
 from typing import Any
 
 from kafka_di.app.models import Config
@@ -64,9 +65,19 @@ class Kafka:
         except ValueError:
             pass
 
+        failures = SimpleQueue()
+
+        def run_consumer(consumer):
+            try:
+                consumer.run()
+            except BaseException as error:
+                failures.put(error)
+                for registered in self.consumers:
+                    registered.stop()
+
         threads = []
         for consumer in self.consumers:
-            thread = threading.Thread(target=consumer.run, daemon=True)
+            thread = threading.Thread(target=run_consumer, args=(consumer,), daemon=True)
             thread.start()
             threads.append(thread)
 
@@ -74,7 +85,13 @@ class Kafka:
             for thread in threads:
                 while thread.is_alive():
                     thread.join(timeout=0.1)
+                    if not failures.empty():
+                        raise failures.get()
+            if not failures.empty():
+                raise failures.get()
         except (KeyboardInterrupt, SystemExit):
+            pass
+        finally:
             for consumer in self.consumers:
                 consumer.stop()
             for thread in threads:

@@ -4,5 +4,6 @@ from . import config
 from .app import Kafka
 from .codecs import Codec, JsonCodec
 from .consumer import Consumer, ConsumerContext, MessageContext, Subscription
+from .consumer.reliability import RetryPolicy
 from .di import DependencyContext, DependencyResolver, Depends
 from .producer import Producer

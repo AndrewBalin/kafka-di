@@ -5,7 +5,8 @@ import docker
 import pytest
 from testcontainers.kafka import KafkaContainer
 
-from kafka_di import Kafka
+from kafka_di import Kafka, RetryPolicy
+from kafka_di.consumer.consumer import MessageRetryRequiredError
 from kafka_di.di import Depends
 from kafka_di.middlewares import ConsumerMiddleware
 
@@ -158,6 +159,7 @@ def test_context_uncommit_leaves_message_unprocessed(kafka_config):
 
     first_app = Kafka(configs=first_config)
     first_run_messages = []
+    first_run_errors = []
 
     @first_app.consumer.subscribe('uncommit-topic')
     def handle_first(msg, context):
@@ -167,7 +169,13 @@ def test_context_uncommit_leaves_message_unprocessed(kafka_config):
 
     import threading
 
-    first_thread = threading.Thread(target=first_app.run)
+    def first_run():
+        try:
+            first_app.run()
+        except MessageRetryRequiredError as error:
+            first_run_errors.append(error)
+
+    first_thread = threading.Thread(target=first_run)
     first_thread.daemon = True
     first_thread.start()
 
@@ -177,6 +185,7 @@ def test_context_uncommit_leaves_message_unprocessed(kafka_config):
 
     first_thread.join(timeout=15)
     assert first_run_messages == ['retry me']
+    assert len(first_run_errors) == 1
 
     second_config = kafka_config.copy()
     second_config['group.id'] = 'test-group-uncommit'
@@ -196,3 +205,69 @@ def test_context_uncommit_leaves_message_unprocessed(kafka_config):
     second_thread.join(timeout=15)
 
     assert second_run_messages == ['retry me']
+
+
+def test_retry_dlq_acknowledged_before_later_offset(kafka_config):
+    import threading
+    from uuid import uuid4
+
+    from confluent_kafka import Consumer as KafkaConsumer
+    from confluent_kafka import Producer as KafkaProducer
+
+    from kafka_di import Consumer
+
+    topic = 'reliability-' + uuid4().hex
+    group = topic + '-consumer'
+    attempts, failures = [], []
+    consumer = Consumer(
+        configs={**kafka_config, 'group.id': group},
+        retry_policy=RetryPolicy(max_attempts=2, initial_delay=0),
+    )
+
+    @consumer.subscribe(topic)
+    def handle(message):
+        attempts.append(message.value)
+        if message.value == b'poison':
+            raise ValueError('sensitive exception text must not leave the process')
+        consumer.stop()
+
+    def run():
+        try:
+            consumer.run()
+        except Exception as error:
+            failures.append(error)
+
+    thread = threading.Thread(target=run, daemon=True)
+    thread.start()
+    producer = KafkaProducer({'bootstrap.servers': kafka_config['bootstrap.servers']})
+    try:
+        producer.produce(topic, partition=0, value=b'poison', headers=[('event_id', b'stable-id')])
+        producer.produce(topic, partition=0, value=b'valid')
+        assert producer.flush(15) == 0
+        thread.join(timeout=30)
+        assert not thread.is_alive()
+        assert failures == []
+        assert attempts == [b'poison', b'poison', b'valid']
+        assert consumer.metrics == {'delivery_failures': 2, 'retries': 1, 'dlq_count': 1}
+
+        dlq = KafkaConsumer({**kafka_config, 'group.id': topic + '-dlq', 'enable.auto.commit': False})
+        try:
+            dlq.subscribe([topic + '.' + group + '.dlq'])
+            deadline = time.monotonic() + 20
+            record = None
+            while time.monotonic() < deadline:
+                candidate = dlq.poll(1)
+                if candidate is not None and not candidate.error():
+                    record = candidate
+                    break
+            assert record is not None
+            assert record.value() == b'poison'
+            headers = dict(record.headers())
+            assert headers['event_id'] == b'stable-id'
+            assert headers['x-kafka-di-original-offset'] == b'0'
+            assert b'sensitive exception' not in repr(record.headers()).encode()
+        finally:
+            dlq.close()
+    finally:
+        consumer.stop()
+        thread.join(timeout=5)

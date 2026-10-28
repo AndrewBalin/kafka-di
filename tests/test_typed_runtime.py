@@ -121,7 +121,10 @@ async def test_consumer_decodes_subscription_payload_and_honours_uncommit():
     kafka_consumer = KafkaConsumer()
     consumer._consumer = kafka_consumer
 
-    await consumer._process_message(KafkaMessage())
+    from kafka_di.consumer.consumer import MessageRetryRequiredError
+
+    with pytest.raises(MessageRetryRequiredError):
+        await consumer._process_message(KafkaMessage())
 
     assert received == [Event(name='created')]
     assert kafka_consumer.commits == []
